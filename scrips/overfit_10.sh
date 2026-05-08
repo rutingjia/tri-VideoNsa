@@ -19,10 +19,12 @@ export CELOSS_PARALLEL_SIZE=16384
 
 # Qwen3 decoder-side VideoNSA.
 export VIDEONSA_ENABLE=1
-export VIDEONSA_LOCAL_WINDOW=256
-export VIDEONSA_SELECT_BLOCK_SIZE=64
-export VIDEONSA_SELECT_TOPK_BLOCKS=4
+export VIDEONSA_BLOCK_SIZE=64
+export VIDEONSA_BLOCK_COUNTS=16
+export VIDEONSA_WINDOW_SIZE=512
 export VIDEONSA_PRINT_ONCE=1
+export VIDEONSA_DEBUG_SHAPES=1
+export VIDEONSA_FALLBACK_ON_ERROR=0
 
 swift sft \
     --model Qwen/Qwen3-VL-2B-Instruct \
@@ -60,5 +62,5 @@ swift sft \
     --report_to tensorboard \
     --logging_dir logs/qwen3_videonsa_overfit_10 \
     --output_dir output/qwen3_videonsa_overfit_10 \
-    --strict true \
+    --strict false \
     --max_steps 200
