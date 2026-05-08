@@ -371,12 +371,22 @@ class Qwen2VLTemplate(Template):
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
+            videonsa_vision_mask = None
+
             if video_embeds is not None:
-                video_mask = (input_ids == model.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                videonsa_vision_mask = (input_ids == model.config.video_token_id)
+                video_mask = videonsa_vision_mask.unsqueeze(-1).expand_as(inputs_embeds)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        return {'inputs_embeds': inputs_embeds}
+        res = {'inputs_embeds': inputs_embeds}
+
+        if videonsa_vision_mask is not None:
+            res['videonsa_vision_mask'] = videonsa_vision_mask
+
+        return res
+
+
 
     def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         res = super()._data_collator_mm_data(batch)

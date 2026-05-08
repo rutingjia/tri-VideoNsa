@@ -82,23 +82,30 @@ def videonsa_mixed_attention_forward(
     **kwargs,
 ):
     """
-    VideoNSA-style mixed decoder attention.
+    Strict VideoNSA-style mixed decoder attention.
 
-    Text tokens:
-        original Qwen3-VL attention
+    hidden_states / q / k / v are mixed text+video tokens.
 
-    Video tokens:
-        NSA attention
+    Logic:
+        1. Use vision_mask to split mixed query tokens into:
+           - text query tokens
+           - video query tokens
 
-    Final:
-        scatter video NSA output back into the dense output.
+        2. Text branch:
+           text queries + mixed keys/values -> original dense attention
+
+        3. Video branch:
+           video queries + mixed keys/values -> nsa_func
+
+        4. Merge:
+           output = text_output + video_output
     """
 
     batch_size, q_len, _ = hidden_states.shape
     k_len = key_states.shape[2]
 
     # Generation decode with KV cache: q_len is usually 1, k_len is long.
-    # For now, keep original Qwen3-VL attention.
+    # Keep original Qwen3-VL attention for now.
     if q_len != k_len:
         return _original_attention_forward(
             module=module,
@@ -113,7 +120,7 @@ def videonsa_mixed_attention_forward(
 
     vision_mask = getattr(module, "_videonsa_vision_mask", None)
 
-    # If no vision mask, fallback to original attention.
+    # If no mask, fallback to original attention.
     if vision_mask is None:
         return _original_attention_forward(
             module=module,
@@ -126,7 +133,7 @@ def videonsa_mixed_attention_forward(
             **kwargs,
         )
 
-    vision_mask = vision_mask.to(hidden_states.device)
+    vision_mask = vision_mask.to(device=hidden_states.device, dtype=torch.bool)
 
     # Mask shape must match current full-prefill sequence.
     if vision_mask.shape[0] != batch_size or vision_mask.shape[1] != q_len:
@@ -141,11 +148,42 @@ def videonsa_mixed_attention_forward(
             **kwargs,
         )
 
-    # 1. Original Qwen3-VL attention for all tokens.
-    # Text tokens will keep this output.
-    dense_output, dense_weights = _original_attention_forward(
+    # No video token: original dense attention.
+    if not vision_mask.any():
+        return _original_attention_forward(
+            module=module,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            dropout=dropout,
+            scaling=module.scaling,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Mixed token masks
+    # ------------------------------------------------------------------
+    text_mask = ~vision_mask
+
+    # query_states shape: [B, H, L, D]
+    # dense attention output shape: [B, L, H, D]
+    text_query_mask = text_mask[:, None, :, None]      # [B, 1, L, 1]
+    video_query_mask = vision_mask[:, None, :, None]   # [B, 1, L, 1]
+
+    text_output_mask = text_mask[:, :, None, None]     # [B, L, 1, 1]
+    video_output_mask = vision_mask[:, :, None, None]  # [B, L, 1, 1]
+
+    # ------------------------------------------------------------------
+    # 2. Text branch: text query tokens use original dense attention.
+    #    K/V remain mixed, because text tokens still need to attend to
+    #    previous video/text context.
+    # ------------------------------------------------------------------
+    text_query_states = query_states * text_query_mask
+
+    text_output, dense_weights = _original_attention_forward(
         module=module,
-        query_states=query_states,
+        query_states=text_query_states,
         key_states=key_states,
         value_states=value_states,
         attention_mask=attention_mask,
@@ -153,64 +191,80 @@ def videonsa_mixed_attention_forward(
         scaling=module.scaling,
         **kwargs,
     )
-    # dense_output: [B, L, H, D]
+    # text_output: [B, L, H, D]
+    text_output = text_output * text_output_mask
 
-    # 2. Gate projection for NSA branches.
+    # ------------------------------------------------------------------
+    # 3. Video branch: video query tokens use NSA.
+    #    Start from the same mixed q/k/v, but only video queries are active.
+    # ------------------------------------------------------------------
+    # Qwen3 states:
+    #   query_states: [B, H, L, D]
+    # NSA wants:
+    #   q/k/v: [B, L, H, D]
+    q = query_states.transpose(1, 2).contiguous()  # [B, L, H, D]
+    k = key_states.transpose(1, 2).contiguous()    # [B, L, H_kv, D]
+    v = value_states.transpose(1, 2).contiguous()  # [B, L, H_kv, D]
+
+    q_video = q * video_output_mask
+
+    # Gate projection for NSA branches.
     g = module.g_proj(hidden_states)
     g = g.view(batch_size, q_len, module.num_heads_for_nsa, 3)
     g_cmp, g_slc, g_swa = g.sigmoid().unbind(-1)
     # each: [B, L, H]
 
+    # Only video query positions should contribute to NSA output.
+    gate_video_mask = vision_mask[:, :, None]  # [B, L, 1]
+    g_cmp = g_cmp * gate_video_mask
+    g_slc = g_slc * gate_video_mask
+    g_swa = g_swa * gate_video_mask
+
     block_size = _env_int("VIDEONSA_BLOCK_SIZE", 64)
     block_count = _env_int("VIDEONSA_BLOCK_COUNTS", 16)
     window_size = _env_int("VIDEONSA_WINDOW_SIZE", 512)
 
-    mixed_output = dense_output.clone()
+    cur_block_count = min(
+        block_count,
+        max(1, (q_len + block_size - 1) // block_size),
+    )
+    cur_window_size = min(window_size, q_len)
 
-    # 3. Only video tokens go through NSA.
-    for b in range(batch_size):
-        video_idx = torch.nonzero(vision_mask[b], as_tuple=False).squeeze(-1)
+    video_output = nsa_func(
+        q=q_video,
+        k=k,
+        v=v,
+        g_cmp=g_cmp,
+        g_slc=g_slc,
+        g_swa=g_swa,
+        block_count=cur_block_count,
+        block_size=block_size,
+        window_size=cur_window_size,
+        scale=module.scaling,
+        return_attn_weights=False,
+        layer_idx=getattr(module, "layer_idx", None),
+    )
+    # video_output: [B, L, H, D]
+    video_output = video_output * video_output_mask
 
-        if video_idx.numel() == 0:
-            continue
+    # ------------------------------------------------------------------
+    # 4. Merge two branches back to mixed sequence.
+    # ------------------------------------------------------------------
+    mixed_output = text_output + video_output
 
-        # Qwen3 states:
-        #   query_states: [B, H, L, D]
-        # NSA wants:
-        #   q/k/v: [B, L, H, D]
-        q_v = query_states[b:b + 1, :, video_idx, :].transpose(1, 2).contiguous()
-        k_v = key_states[b:b + 1, :, video_idx, :].transpose(1, 2).contiguous()
-        v_v = value_states[b:b + 1, :, video_idx, :].transpose(1, 2).contiguous()
-
-        g_cmp_v = g_cmp[b:b + 1, video_idx, :].contiguous()
-        g_slc_v = g_slc[b:b + 1, video_idx, :].contiguous()
-        g_swa_v = g_swa[b:b + 1, video_idx, :].contiguous()
-
-        video_len = int(video_idx.numel())
-
-        cur_block_count = min(
-            block_count,
-            max(1, (video_len + block_size - 1) // block_size),
+    if _env_flag("VIDEONSA_DEBUG_SHAPES", "0") and not getattr(module, "_videonsa_debug_printed", False):
+        print(
+            "[Qwen3-VideoNSA][strict-mixed] "
+            f"layer={getattr(module, 'layer_idx', None)}, "
+            f"hidden={tuple(hidden_states.shape)}, "
+            f"text_tokens={int(text_mask.sum().item())}, "
+            f"video_tokens={int(vision_mask.sum().item())}, "
+            f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+            f"text_output={tuple(text_output.shape)}, "
+            f"video_output={tuple(video_output.shape)}, "
+            f"mixed_output={tuple(mixed_output.shape)}"
         )
-        cur_window_size = min(window_size, video_len)
-
-        nsa_output = nsa_func(
-            q=q_v,
-            k=k_v,
-            v=v_v,
-            g_cmp=g_cmp_v,
-            g_slc=g_slc_v,
-            g_swa=g_swa_v,
-            block_count=cur_block_count,
-            block_size=block_size,
-            window_size=cur_window_size,
-            scale=module.scaling,
-            return_attn_weights=False,
-            layer_idx=getattr(module, "layer_idx", None),
-        )
-        # nsa_output: [1, num_video_tokens, H, D]
-
-        mixed_output[b:b + 1, video_idx, :, :] = nsa_output
+        module._videonsa_debug_printed = True
 
     return mixed_output, dense_weights
 
@@ -348,39 +402,45 @@ class Qwen3VLForConditionalGenerationVideoNSA(Qwen3VLForConditionalGeneration):
         self._videonsa_num_layers = len(layers)
 
     def forward(self, *args, **kwargs):
-        input_ids = kwargs.get("input_ids", None)
+    # Prefer the mask created in the template before input_ids is replaced by inputs_embeds.
+    # Shape should be [B, L], bool.
+    video_token_mask = kwargs.pop("videonsa_vision_mask", None)
 
+    # Fallback: if input_ids is still available, build the mask from video_token_id.
+    input_ids = kwargs.get("input_ids", None)
+    if video_token_mask is None:
         if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]):
-        input_ids = args[0]
+            input_ids = args[0]
 
-        video_token_mask = None
         if input_ids is not None and torch.is_tensor(input_ids):
             video_token_mask = input_ids.eq(self._videonsa_video_token_id)
 
-        if _env_flag("VIDEONSA_PRINT_ONCE", "0") and not getattr(self, "_videonsa_printed", False):
-            num_video_tokens = int(video_token_mask.sum().item()) if video_token_mask is not None else -1
-            print(
-                "[Qwen3-VideoNSA] "
-                f"decoder_layers={self._videonsa_num_layers}, "
-                f"video_token_id={self._videonsa_video_token_id}, "
-                f"num_video_tokens={num_video_tokens}, "
-                f"enable={os.getenv('VIDEONSA_ENABLE', '1')}, "
-                f"mode=mixed_text_dense_video_nsa, "
-                f"block_size={os.getenv('VIDEONSA_BLOCK_SIZE', '64')}, "
-                f"block_counts={os.getenv('VIDEONSA_BLOCK_COUNTS', '16')}, "
-                f"window_size={os.getenv('VIDEONSA_WINDOW_SIZE', '512')}"
-            )
-            self._videonsa_printed = True
+    # Make sure the mask is bool if it exists.
+    if video_token_mask is not None:
+        video_token_mask = video_token_mask.to(dtype=torch.bool)
 
-        # Pass video mask to every decoder attention layer.
-        for layer in self.model.language_model.layers:
-            layer.self_attn._videonsa_vision_mask = video_token_mask
+    if _env_flag("VIDEONSA_PRINT_ONCE", "0") and not getattr(self, "_videonsa_printed", False):
+        num_video_tokens = int(video_token_mask.sum().item()) if video_token_mask is not None else -1
+        print(
+            "[Qwen3-VideoNSA] "
+            f"decoder_layers={self._videonsa_num_layers}, "
+            f"video_token_id={self._videonsa_video_token_id}, "
+            f"num_video_tokens={num_video_tokens}, "
+            f"enable={os.getenv('VIDEONSA_ENABLE', '1')}, "
+            f"mode=mixed_text_dense_video_nsa, "
+            f"block_size={os.getenv('VIDEONSA_BLOCK_SIZE', '64')}, "
+            f"block_counts={os.getenv('VIDEONSA_BLOCK_COUNTS', '16')}, "
+            f"window_size={os.getenv('VIDEONSA_WINDOW_SIZE', '512')}"
+        )
+        self._videonsa_printed = True
 
-        try:
-            return super().forward(*args, **kwargs)
-        finally:
-            # Avoid stale mask being reused in the next forward.
-            for layer in self.model.language_model.layers:
-                layer.self_attn._videonsa_vision_mask = None
+    # Pass video mask to every decoder attention layer.
+    for layer in self.model.language_model.layers:
+        layer.self_attn._videonsa_vision_mask = video_token_mask
 
+    try:
         return super().forward(*args, **kwargs)
+    finally:
+        # Avoid stale mask being reused in the next forward.
+        for layer in self.model.language_model.layers:
+            layer.self_attn._videonsa_vision_mask = None
