@@ -3,7 +3,8 @@ import os
 from typing import Any, Dict, Optional, Tuple, Type
 
 import torch
-from transformers import AutoConfig, AutoModelForImageTextToText, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizerBase
+from transformers import AutoConfig, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizerBase
+from .qwen3_vl_videonsa import Qwen3VLForConditionalGenerationVideoNSA
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
@@ -84,7 +85,7 @@ def get_model_tokenizer_qwen2_vl(*args, **kwargs):
     return model, tokenizer
 
 def get_model_tokenizer_videonsa(*args, **kwargs):
-    kwargs['automodel_class'] = AutoModelForImageTextToText
+    kwargs['automodel_class'] = Qwen3VLForConditionalGenerationVideoNSA
     model, tokenizer = get_model_tokenizer_multimodal(*args, **kwargs)
     if model is not None:
         base_model = model.model if hasattr(model, "model") else model

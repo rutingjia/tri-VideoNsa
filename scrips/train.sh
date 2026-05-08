@@ -16,7 +16,7 @@ export CELOSS_PARALLEL_SIZE=16384
 # Use a Swift-supported model_type that matches Qwen3-VL architecture.
 swift sft \
     --model Qwen/Qwen3-VL-2B-Instruct \
-    --model_type qwen3_vl \
+    --model_type videonsa \
     --deepspeed zero2 \
     --freeze_vit false \
     --freeze_aligner false \
