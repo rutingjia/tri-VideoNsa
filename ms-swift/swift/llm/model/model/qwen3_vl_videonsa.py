@@ -22,7 +22,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     eager_attention_forward,
 )
 
-from fla.ops.nsa.parallel import parallel_nsa
+from nsa.nsa import nsa_func
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -71,85 +71,148 @@ def _original_attention_forward(
     )
 
 
-def real_videonsa_attention_forward(
+def videonsa_mixed_attention_forward(
     module: nn.Module,
     hidden_states: torch.Tensor,
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor],
+    dropout: float,
+    **kwargs,
 ):
     """
-    Real NSA forward following Qwen2.5 / NativeSparseAttention logic.
+    VideoNSA-style mixed decoder attention.
 
-    Input Qwen3 shapes:
-        hidden_states: [B, L, C]
-        query_states: [B, H, L, D]
-        key_states:   [B, H_kv, L, D]
-        value_states: [B, H_kv, L, D]
+    Text tokens:
+        original Qwen3-VL attention
 
-    NSA expected shapes:
-        q:     [B, L, H, D]
-        k:     [B, L, H_kv, D]
-        v:     [B, L, H_kv, D]
-        g_*:   [B, L, H]
+    Video tokens:
+        NSA attention
+
+    Final:
+        scatter video NSA output back into the dense output.
     """
+
     batch_size, q_len, _ = hidden_states.shape
     k_len = key_states.shape[2]
 
-    # Training/full-prefill path only.
-    # For generation with KV cache, q_len may be 1 and k_len long.
-    # Keep original dense backend there first; we can optimize generation later.
+    # Generation decode with KV cache: q_len is usually 1, k_len is long.
+    # For now, keep original Qwen3-VL attention.
     if q_len != k_len:
-        return None
+        return _original_attention_forward(
+            module=module,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            dropout=dropout,
+            scaling=module.scaling,
+            **kwargs,
+        )
 
-    # NSA kernels are causal by design. Arbitrary 4D additive masks from HF
-    # are not passed into parallel_nsa, matching NativeSparseAttention style.
-    # For now we only use NSA on normal full training sequences.
-    if attention_mask is not None and attention_mask.ndim not in (2, 4):
-        return None
+    vision_mask = getattr(module, "_videonsa_vision_mask", None)
 
-    # Qwen3 gives [B, H, L, D], NSA wants [B, L, H, D].
-    q = query_states.transpose(1, 2).contiguous()
-    k = key_states.transpose(1, 2).contiguous()
-    v = value_states.transpose(1, 2).contiguous()
+    # If no vision mask, fallback to original attention.
+    if vision_mask is None:
+        return _original_attention_forward(
+            module=module,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            dropout=dropout,
+            scaling=module.scaling,
+            **kwargs,
+        )
 
-    # Qwen2.5 NSA logic:
-    #   g = g_proj(hidden_states)
-    #   g_cmp, g_slc, g_swa = sigmoid(g).unbind(-1)
+    vision_mask = vision_mask.to(hidden_states.device)
+
+    # Mask shape must match current full-prefill sequence.
+    if vision_mask.shape[0] != batch_size or vision_mask.shape[1] != q_len:
+        return _original_attention_forward(
+            module=module,
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            dropout=dropout,
+            scaling=module.scaling,
+            **kwargs,
+        )
+
+    # 1. Original Qwen3-VL attention for all tokens.
+    # Text tokens will keep this output.
+    dense_output, dense_weights = _original_attention_forward(
+        module=module,
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+        attention_mask=attention_mask,
+        dropout=dropout,
+        scaling=module.scaling,
+        **kwargs,
+    )
+    # dense_output: [B, L, H, D]
+
+    # 2. Gate projection for NSA branches.
     g = module.g_proj(hidden_states)
     g = g.view(batch_size, q_len, module.num_heads_for_nsa, 3)
     g_cmp, g_slc, g_swa = g.sigmoid().unbind(-1)
+    # each: [B, L, H]
 
     block_size = _env_int("VIDEONSA_BLOCK_SIZE", 64)
-    block_counts = _env_int("VIDEONSA_BLOCK_COUNTS", 16)
+    block_count = _env_int("VIDEONSA_BLOCK_COUNTS", 16)
     window_size = _env_int("VIDEONSA_WINDOW_SIZE", 512)
 
-    if _env_flag("VIDEONSA_DEBUG_SHAPES", "0") and not getattr(module, "_videonsa_debug_printed", False):
-        print(
-            "[Qwen3-VideoNSA][real_nsa] "
-            f"layer={module.layer_idx}, "
-            f"hidden={tuple(hidden_states.shape)}, "
-            f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
-            f"g_cmp={tuple(g_cmp.shape)}, "
-            f"block_size={block_size}, block_counts={block_counts}, window_size={window_size}"
+    mixed_output = dense_output.clone()
+
+    # 3. Only video tokens go through NSA.
+    for b in range(batch_size):
+        video_idx = torch.nonzero(vision_mask[b], as_tuple=False).squeeze(-1)
+
+        if video_idx.numel() == 0:
+            continue
+
+        # Qwen3 states:
+        #   query_states: [B, H, L, D]
+        # NSA wants:
+        #   q/k/v: [B, L, H, D]
+        q_v = query_states[b:b + 1, :, video_idx, :].transpose(1, 2).contiguous()
+        k_v = key_states[b:b + 1, :, video_idx, :].transpose(1, 2).contiguous()
+        v_v = value_states[b:b + 1, :, video_idx, :].transpose(1, 2).contiguous()
+
+        g_cmp_v = g_cmp[b:b + 1, video_idx, :].contiguous()
+        g_slc_v = g_slc[b:b + 1, video_idx, :].contiguous()
+        g_swa_v = g_swa[b:b + 1, video_idx, :].contiguous()
+
+        video_len = int(video_idx.numel())
+
+        cur_block_count = min(
+            block_count,
+            max(1, (video_len + block_size - 1) // block_size),
         )
-        module._videonsa_debug_printed = True
+        cur_window_size = min(window_size, video_len)
 
-    o = parallel_nsa(
-        q=q,
-        k=k,
-        v=v,
-        g_cmp=g_cmp,
-        g_slc=g_slc,
-        g_swa=g_swa,
-        block_size=block_size,
-        block_counts=block_counts,
-        window_size=window_size,
-    )
+        nsa_output = nsa_func(
+            q=q_v,
+            k=k_v,
+            v=v_v,
+            g_cmp=g_cmp_v,
+            g_slc=g_slc_v,
+            g_swa=g_swa_v,
+            block_count=cur_block_count,
+            block_size=block_size,
+            window_size=cur_window_size,
+            scale=module.scaling,
+            return_attn_weights=False,
+            layer_idx=getattr(module, "layer_idx", None),
+        )
+        # nsa_output: [1, num_video_tokens, H, D]
 
-    # parallel_nsa returns [B, L, H, D].
-    return o, None
+        mixed_output[b:b + 1, video_idx, :, :] = nsa_output
+
+    return mixed_output, dense_weights
 
 
 class Qwen3VLTextVideoNSAAttention(Qwen3VLTextAttention):
@@ -210,31 +273,38 @@ class Qwen3VLTextVideoNSAAttention(Qwen3VLTextAttention):
 
         if use_videonsa:
             try:
-                result = real_videonsa_attention_forward(
+                attn_output, attn_weights = videonsa_mixed_attention_forward(
                     module=self,
                     hidden_states=hidden_states,
                     query_states=query_states,
                     key_states=key_states,
                     value_states=value_states,
                     attention_mask=attention_mask,
+                    dropout=dropout,
+                    **kwargs,
                 )
-                if result is not None:
-                    attn_output, attn_weights = result
             except Exception as e:
                 if _env_flag("VIDEONSA_FALLBACK_ON_ERROR", "1"):
                     if not getattr(self, "_videonsa_error_printed", False):
                         print(
-                            "[Qwen3-VideoNSA][warning] real NSA failed once; "
+                            "[Qwen3-VideoNSA][warning] mixed VideoNSA failed once; "
                             f"fallback to original attention. error={repr(e)}"
                         )
                         self._videonsa_error_printed = True
-                    attn_output = None
-                    attn_weights = None
+
+                    attn_output, attn_weights = _original_attention_forward(
+                        module=self,
+                        query_states=query_states,
+                        key_states=key_states,
+                        value_states=value_states,
+                        attention_mask=attention_mask,
+                        dropout=dropout,
+                        scaling=self.scaling,
+                        **kwargs,
+                    )
                 else:
                     raise
-
-        # Fallback keeps original backend, including flash_attn when --attn_impl flash_attn is used.
-        if attn_output is None:
+        else:
             attn_output, attn_weights = _original_attention_forward(
                 module=self,
                 query_states=query_states,
@@ -281,7 +351,7 @@ class Qwen3VLForConditionalGenerationVideoNSA(Qwen3VLForConditionalGeneration):
         input_ids = kwargs.get("input_ids", None)
 
         if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]):
-            input_ids = args[0]
+        input_ids = args[0]
 
         video_token_mask = None
         if input_ids is not None and torch.is_tensor(input_ids):
@@ -295,11 +365,22 @@ class Qwen3VLForConditionalGenerationVideoNSA(Qwen3VLForConditionalGeneration):
                 f"video_token_id={self._videonsa_video_token_id}, "
                 f"num_video_tokens={num_video_tokens}, "
                 f"enable={os.getenv('VIDEONSA_ENABLE', '1')}, "
-                f"real_nsa=parallel_nsa, "
+                f"mode=mixed_text_dense_video_nsa, "
                 f"block_size={os.getenv('VIDEONSA_BLOCK_SIZE', '64')}, "
                 f"block_counts={os.getenv('VIDEONSA_BLOCK_COUNTS', '16')}, "
                 f"window_size={os.getenv('VIDEONSA_WINDOW_SIZE', '512')}"
             )
             self._videonsa_printed = True
+
+        # Pass video mask to every decoder attention layer.
+        for layer in self.model.language_model.layers:
+            layer.self_attn._videonsa_vision_mask = video_token_mask
+
+        try:
+            return super().forward(*args, **kwargs)
+        finally:
+            # Avoid stale mask being reused in the next forward.
+            for layer in self.model.language_model.layers:
+                layer.self_attn._videonsa_vision_mask = None
 
         return super().forward(*args, **kwargs)
